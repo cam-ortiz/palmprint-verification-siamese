@@ -55,7 +55,7 @@ def collect_samples_for_subjects(
     Collect (image_path, label) pairs for each subject folder.
     """
     samples = []
-    valid_ext = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", "heif")
+    valid_ext = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heif")
 
     for sid in subjects:
         subj_dir = os.path.join(root_dir, sid)
@@ -89,4 +89,5 @@ def build_bmpd_splits(root_dir: str, seed: int = 42) -> Dict[str, List[Sample]]:
         "val":   collect_samples_for_subjects(root_dir, splits["val"],   subject_to_label),
         "test":  collect_samples_for_subjects(root_dir, splits["test"],  subject_to_label),
     }
+
 
