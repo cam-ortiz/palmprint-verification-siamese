@@ -58,6 +58,14 @@ class PalmprintMetrics:
         idx = np.nanargmin(np.abs(fpr - fnr))
         return fpr[idx]
 
+    def tar_at_far(self, target_far=0.01):
+        if self.y_scores is None:
+            return None
+
+        fpr, tpr, _ = roc_curve(self.y_true, self.y_scores)
+        idx = np.argmin(np.abs(fpr - target_far))
+        return tpr[idx]
+
 def report(self):
     print("==== Palmprint Evaluation Metrics ====")
     print(f"Accuracy: {self.accuracy:.4f}")
@@ -73,6 +81,10 @@ def report(self):
     eer = self.eer()
     if eer is not None:
         print(f"EER           : {eer:.4f}")
-    
+
+    tar = self.tar_at_far()
+    if tar is not None:
+        print(f"TAR @ FAR=0.01: {tar:.4f}")
+        
     print("\nConfusion Matrix:")
     print(self.cm())
