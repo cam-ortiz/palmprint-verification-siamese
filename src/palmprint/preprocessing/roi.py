@@ -100,7 +100,7 @@ class RoiExtractionConfig:
     threshold_method: ThresholdMethod = "otsu"  # "otsu" or "adaptive"
     adaptive_block_size: int = 31
     adaptive_c: float = 5.0
-    adaptive_invert: bool = False
+    adaptive_invert: bool = True
 
     morph_kernel_size: tuple[int, int] = (11, 11)
     morph_close_iterations: int = 2
@@ -110,6 +110,16 @@ class RoiExtractionConfig:
     bbox_margin_frac: float = 0.03
     roi_crop_frac: float = 0.65
     crop_method: CropMethod = "centroid"   # "center" or "centroid"
+    
+    rotate_to_principal_axis: bool = False
+    RotationCenter = Literal["centroid", "image_center"]
+    rotation_center: RotationCenter = "centroid"
+    
+    valley_roi_size: int = 224
+    valley_crop_width_scale: float = 2.2
+    valley_crop_height_scale: float = 2.2
+    valley_down_scale: float = 1.15
+    min_defect_depth: float = 20.0
 
 
 @dataclass(slots=True)
@@ -151,6 +161,11 @@ class RoiExtractionResult:
     tight_crop_bgr: CropResult
     tight_crop_mask: CropResult
     final_roi: CropResult
+    rotation_angle_deg: float | None = None
+    rotated_bgr: BgrImage | None = None
+    rotated_mask: BinaryMask | None = None
+    rotated_tight_crop_bgr: BgrImage | None = None
+    rotated_tight_crop_mask: BinaryMask | None = None
 
 
 def to_grayscale(image: BgrImage) -> GrayImage:
@@ -514,6 +529,8 @@ def center_crop_image(
     CropResult
         Center crop and coordinates.
     """
+    if not 0 < crop_frac <= 1:
+        raise ValueError("crop_frac must be in the interval (0, 1].")
     height, width = image.shape[:2]
     crop_w = int(width * crop_frac)
     crop_h = int(height * crop_frac)
@@ -589,6 +606,139 @@ def crop_around_mask_centroid(
 
     cropped = image[y0:y1, x0:x1]
     return CropResult(image=cropped, x0=x0, y0=y0, x1=x1, y1=y1)
+
+
+@dataclass(slots=True)
+class PrincipalAxisResult:
+    """
+    PCA-based orientation information derived from a binary hand mask.
+
+    Attributes
+    ----------
+    angle_deg : float
+        Angle of the first principal axis in degrees, measured from the
+        positive x-axis in image coordinates.
+    centroid_xy : tuple[float, float]
+        Mean x/y coordinate of the foreground mask pixels.
+    eigenvectors : np.ndarray
+        Principal directions returned by OpenCV PCA.
+    eigenvalues : np.ndarray
+        Variances along the principal directions.
+    """
+    angle_deg: float
+    centroid_xy: tuple[float, float]
+    eigenvectors: npt.NDArray[np.float32]
+    eigenvalues: npt.NDArray[np.float32]
+
+
+@dataclass(slots=True)
+class RotationResult:
+    """
+    Result of an affine in-place image rotation.
+
+    Attributes
+    ----------
+    image : np.ndarray
+        Rotated output image with the same spatial dimensions as the input.
+    matrix : np.ndarray
+        2x3 affine transformation matrix returned by OpenCV.
+    """
+    image: npt.NDArray[np.uint8]
+    matrix: npt.NDArray[np.float64]
+    
+
+def rotate_image(
+    image: npt.NDArray[np.uint8],
+    angle_deg: float,
+    *,
+    center: tuple[float, float] | None = None,
+    interp: int = cv2.INTER_LINEAR,
+    border_mode: int = cv2.BORDER_CONSTANT,
+    border_value: int | tuple[int, int, int] = 0,
+) -> RotationResult:
+    """
+    Rotate an image in place while preserving its original output size.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input grayscale or color image.
+    angle_deg : float
+        Rotation angle in degrees. Positive values follow OpenCV's
+        counterclockwise convention.
+    center : tuple[float, float] | None, optional
+        Rotation center as (x, y). If None, the image center is used.
+    interp : int, optional
+        OpenCV interpolation flag. Use INTER_LINEAR for natural images and
+        INTER_NEAREST for masks.
+    border_mode : int, optional
+        OpenCV border mode used outside the image bounds.
+    border_value : int | tuple[int, int, int], optional
+        Fill value when border_mode is BORDER_CONSTANT.
+
+    Returns
+    -------
+    RotationResult
+        Rotated image and the affine transform matrix.
+    """
+    height, width = image.shape[:2]
+
+    if center is None:
+        center = ((width - 1) / 2.0, (height - 1) / 2.0)
+
+    matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    rotated = cv2.warpAffine(
+        image,
+        matrix,
+        (width, height),
+        flags=interp,
+        borderMode=border_mode,
+        borderValue=border_value,
+    )
+    return RotationResult(image=rotated, matrix=matrix)
+
+
+def compute_mask_principal_axis(mask: BinaryMask) -> PrincipalAxisResult:
+    """
+    Compute the dominant orientation of a binary mask using PCA on foreground
+    pixel coordinates.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask with foreground pixels > 0.
+
+    Returns
+    -------
+    PrincipalAxisResult
+        PCA orientation information for the foreground mask.
+
+    Raises
+    ------
+    RuntimeError
+        If the mask contains fewer than two foreground pixels.
+    """
+    ys, xs = np.where(mask > 0)
+
+    if len(xs) < 2:
+        raise RuntimeError("Not enough foreground pixels for PCA.")
+
+    pts = np.column_stack((xs, ys)).astype(np.float32)
+
+    mean, eigenvectors, eigenvalues = cv2.PCACompute2(pts, mean=None)
+
+    vx, vy = eigenvectors[0]
+    angle_rad = np.arctan2(vy, vx)
+    angle_deg = float(np.degrees(angle_rad))
+
+    centroid_xy = (float(mean[0, 0]), float(mean[0, 1]))
+
+    return PrincipalAxisResult(
+        angle_deg=angle_deg,
+        centroid_xy=centroid_xy,
+        eigenvectors=eigenvectors,
+        eigenvalues=eigenvalues,
+    )
 
 
 def extract_hand_roi(
@@ -681,18 +831,73 @@ def extract_hand_roi(
 
     tight_crop_bgr = tight_crop_bgr_result.image
     tight_crop_mask = tight_crop_mask_result.image
+    
+    rotation_angle_deg = None
+    rotated_bgr = None
+    rotated_mask = None
+    rotated_tight_crop_bgr = None
+    rotated_tight_crop_mask = None
+    
+    crop_source_bgr = tight_crop_bgr
+    crop_source_mask = tight_crop_mask
+    
+    if config.rotate_to_principal_axis:
+        axis_result = compute_mask_principal_axis(tight_crop_mask)
+        rotation_angle_deg = -axis_result.angle_deg
+    
+        if config.rotation_center == "centroid":
+            center = axis_result.centroid_xy
+        elif config.rotation_center == "image_center":
+            h, w = tight_crop_mask.shape[:2]
+            center = ((w - 1) / 2.0, (h - 1) / 2.0)
+        else:
+            raise ValueError(f"Unsupported rotation_center: {config.rotation_center}")
+    
+        rotated_bgr_result = rotate_image(
+            tight_crop_bgr,
+            rotation_angle_deg,
+            center=center,
+            interp=cv2.INTER_LINEAR,
+            border_value=0,
+        )
+        rotated_mask_result = rotate_image(
+            tight_crop_mask,
+            rotation_angle_deg,
+            center=center,
+            interp=cv2.INTER_NEAREST,
+            border_value=0,
+        )
+    
+        rotated_bgr = rotated_bgr_result.image
+        rotated_mask = extract_largest_component(rotated_mask_result.image)
+    
+        rotated_contour = extract_largest_contour(rotated_mask)
+    
+        rotated_tight_crop_bgr = crop_to_bounding_box(
+            rotated_bgr,
+            rotated_contour,
+            margin_frac=config.bbox_margin_frac,
+        ).image
+        rotated_tight_crop_mask = crop_to_bounding_box(
+            rotated_mask,
+            rotated_contour,
+            margin_frac=config.bbox_margin_frac,
+        ).image
+    
+        crop_source_bgr = rotated_tight_crop_bgr
+        crop_source_mask = rotated_tight_crop_mask
 
     # Extract the final ROI from the tight crop using configured cropping
     # strategy
     if config.crop_method == "center":
         final_roi_result = center_crop_image(
-            tight_crop_bgr,
+            crop_source_bgr,
             crop_frac=config.roi_crop_frac,
         )
     elif config.crop_method == "centroid":
         final_roi_result = crop_around_mask_centroid(
-            tight_crop_bgr,
-            tight_crop_mask,
+            crop_source_bgr,
+            crop_source_mask,
             crop_frac=config.roi_crop_frac,
         )
     else:
@@ -708,4 +913,533 @@ def extract_hand_roi(
         tight_crop_bgr=tight_crop_bgr_result,
         tight_crop_mask=tight_crop_mask_result,
         final_roi=final_roi_result,
+        rotation_angle_deg=rotation_angle_deg,
+        rotated_bgr=rotated_bgr,
+        rotated_mask=rotated_mask,
+        rotated_tight_crop_bgr=rotated_tight_crop_bgr,
+        rotated_tight_crop_mask=rotated_tight_crop_mask,
+    )
+
+
+@dataclass(slots=True)
+class ValleyLandmarkResult:
+    valley_points: list[tuple[int, int]]
+    selected_valleys: tuple[tuple[int, int], tuple[int, int]]
+    midpoint_xy: tuple[float, float]
+    angle_deg: float
+    valley_distance: float
+
+
+@dataclass(slots=True)
+class ValleyRoiExtractionResult:
+    base_result: RoiExtractionResult
+    landmarks: ValleyLandmarkResult
+    aligned_bgr: BgrImage
+    aligned_mask: BinaryMask
+    final_roi: CropResult
+    
+
+def find_valley_points_from_defects(
+    contour: Contour,
+    *,
+    min_defect_depth: float = 20.0,
+) -> list[tuple[int, int]]:
+    hull = cv2.convexHull(contour, returnPoints=False)
+
+    if hull is None or len(hull) < 4:
+        return []
+
+    defects = cv2.convexityDefects(contour, hull)
+
+    if defects is None:
+        return []
+
+    valleys = []
+
+    for defect in defects[:, 0]:
+        _start_idx, _end_idx, far_idx, depth = defect
+
+        # OpenCV stores depth scaled by 256
+        depth_px = depth / 256.0
+
+        if depth_px < min_defect_depth:
+            continue
+
+        far_point = contour[far_idx][0]
+        valleys.append((int(far_point[0]), int(far_point[1])))
+
+    return valleys
+
+
+def select_two_upper_valleys(
+    valley_points: list[tuple[int, int]],
+    mask: BinaryMask,
+    *,
+    upper_frac: float = 0.55,
+    max_pair_angle_deg: float = 40.0,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    Select two likely finger-valley landmarks from convexity-defect points.
+
+    This filters out lower wrist/palm defects, rejects highly diagonal pairs,
+    then selects the middle pair from the remaining left-to-right valley points.
+    """
+    if len(valley_points) < 2:
+        raise RuntimeError("Not enough valley points found for Option C ROI.")
+
+    ys, xs = np.where(mask > 0)
+    hand_top = int(ys.min())
+    hand_bottom = int(ys.max())
+    hand_height = hand_bottom - hand_top
+
+    # 1. Keep only valleys in upper 55% of the hand.
+    max_y = hand_top + upper_frac * hand_height
+    candidates = [p for p in valley_points if p[1] <= max_y]
+
+    if len(candidates) < 2:
+        candidates = valley_points
+
+    # 2. Sort left-to-right.
+    candidates = sorted(candidates, key=lambda p: p[0])
+
+    # 3. Build near-horizontal neighbor pairs only.
+    valid_pairs = []
+
+    for i in range(len(candidates) - 1):
+        p1 = candidates[i]
+        p2 = candidates[i + 1]
+
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+
+        if dx == 0:
+            continue
+
+        angle_deg = abs(float(np.degrees(np.arctan2(dy, dx))))
+
+        if angle_deg <= max_pair_angle_deg:
+            valid_pairs.append((p1, p2))
+
+    # 4. Choose the middle valid pair instead of the widest pair.
+    if valid_pairs:
+        return valid_pairs[len(valid_pairs) // 2]
+
+    # Fallback: choose middle pair from all upper candidates.
+    if len(candidates) >= 2:
+        mid = len(candidates) // 2
+        return candidates[mid - 1], candidates[mid]
+
+    raise RuntimeError("Could not select two valley points.")
+
+
+def extract_valley_landmark_roi(
+    image: BgrImage,
+    config: RoiExtractionConfig,
+) -> ValleyRoiExtractionResult:
+    base_result = extract_hand_roi(image, config)
+
+    hand_mask = base_result.hand_mask
+    contour = extract_largest_contour(hand_mask)
+
+    valley_points = find_valley_points_from_defects(
+        contour,
+        min_defect_depth=config.min_defect_depth,
+    )
+
+    v1, v2 = select_two_upper_valleys(
+        valley_points,
+        hand_mask,
+        upper_frac=0.55,
+        max_pair_angle_deg=40.0,
+    )
+
+    p1 = np.array(v1, dtype=np.float32)
+    p2 = np.array(v2, dtype=np.float32)
+
+    midpoint = (p1 + p2) / 2.0
+    dx, dy = p2 - p1
+
+    angle_deg = float(np.degrees(np.arctan2(dy, dx)))
+    valley_distance = float(np.linalg.norm(p2 - p1))
+
+    # Rotate so the valley-to-valley line is horizontal.
+    rotate_by = -angle_deg
+
+    aligned_bgr_result = rotate_image(
+        image,
+        rotate_by,
+        center=(float(midpoint[0]), float(midpoint[1])),
+        interp=cv2.INTER_LINEAR,
+        border_value=0,
+    )
+
+    aligned_mask_result = rotate_image(
+        hand_mask,
+        rotate_by,
+        center=(float(midpoint[0]), float(midpoint[1])),
+        interp=cv2.INTER_NEAREST,
+        border_value=0,
+    )
+
+    aligned_bgr = aligned_bgr_result.image
+    aligned_mask = extract_largest_component(aligned_mask_result.image)
+
+    # Transform valley midpoint into rotated coordinates.
+    M = aligned_bgr_result.matrix
+    midpoint_h = np.array([midpoint[0], midpoint[1], 1.0], dtype=np.float32)
+    aligned_midpoint = M @ midpoint_h
+
+    cx = int(aligned_midpoint[0])
+    cy = int(aligned_midpoint[1] + config.valley_down_scale * valley_distance)
+
+    crop_w = int(config.valley_crop_width_scale * valley_distance)
+    crop_h = int(config.valley_crop_height_scale * valley_distance)
+
+    h, w = aligned_bgr.shape[:2]
+
+    x0 = max(0, cx - crop_w // 2)
+    y0 = max(0, cy - crop_h // 2)
+    x1 = min(w, x0 + crop_w)
+    y1 = min(h, y0 + crop_h)
+
+    x0 = max(0, x1 - crop_w)
+    y0 = max(0, y1 - crop_h)
+
+    roi = aligned_bgr[y0:y1, x0:x1]
+
+    if config.valley_roi_size is not None:
+        roi = cv2.resize(
+            roi,
+            (config.valley_roi_size, config.valley_roi_size),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    final_roi = CropResult(
+        image=roi,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+    )
+
+    landmarks = ValleyLandmarkResult(
+        valley_points=valley_points,
+        selected_valleys=(v1, v2),
+        midpoint_xy=(float(midpoint[0]), float(midpoint[1])),
+        angle_deg=angle_deg,
+        valley_distance=valley_distance,
+    )
+
+    return ValleyRoiExtractionResult(
+        base_result=base_result,
+        landmarks=landmarks,
+        aligned_bgr=aligned_bgr,
+        aligned_mask=aligned_mask,
+        final_roi=final_roi,
+    )
+
+@dataclass(slots=True)
+class TopBoundaryValleyRoiResult:
+    base_result: RoiExtractionResult
+    boundary_points: list[tuple[int, int]]
+    valley_points: list[tuple[int, int]]
+    selected_valleys: tuple[tuple[int, int], tuple[int, int]]
+    aligned_bgr: BgrImage
+    aligned_mask: BinaryMask
+    final_roi: CropResult
+    angle_deg: float
+    valley_distance: float
+    
+
+def smooth_1d(values: np.ndarray, window_size: int = 31) -> np.ndarray:
+    """
+    Smooth a 1D signal using a moving average.
+    """
+    if window_size < 3:
+        return values.copy()
+
+    if window_size % 2 == 0:
+        window_size += 1
+
+    kernel = np.ones(window_size, dtype=np.float32) / window_size
+    return np.convolve(values, kernel, mode="same")
+
+
+def extract_top_boundary_curve(
+    mask: BinaryMask,
+    *,
+    upper_frac: float = 0.65,
+) -> list[tuple[int, int]]:
+    """
+    For each x-column, find the first foreground pixel from the top.
+    This traces the upper boundary of the segmented hand.
+    """
+    ys, xs = np.where(mask > 0)
+
+    if xs.size == 0:
+        raise RuntimeError("No foreground pixels found in mask.")
+
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+
+    max_y = int(y_min + upper_frac * (y_max - y_min))
+
+    boundary_points = []
+
+    for x in range(x_min, x_max + 1):
+        column_ys = np.where(mask[:, x] > 0)[0]
+
+        if column_ys.size == 0:
+            continue
+
+        y = int(column_ys.min())
+
+        if y <= max_y:
+            boundary_points.append((x, y))
+
+    return boundary_points
+
+
+def find_top_boundary_valleys(
+    boundary_points: list[tuple[int, int]],
+    *,
+    smooth_window: int = 41,
+    min_prominence: float = 20.0,
+    min_spacing_frac: float = 0.08,
+) -> list[tuple[int, int]]:
+    """
+    Find downward dips in the top-boundary curve.
+
+    Important image-coordinate detail:
+    - Smaller y = higher in the image
+    - Larger y = lower in the image
+    So finger valleys are local maxima in y.
+    """
+    if len(boundary_points) < smooth_window:
+        return []
+
+    xs = np.array([p[0] for p in boundary_points], dtype=np.int32)
+    ys = np.array([p[1] for p in boundary_points], dtype=np.float32)
+
+    ys_smooth = smooth_1d(ys, window_size=smooth_window)
+
+    x_range = xs.max() - xs.min()
+    min_spacing = max(10, int(min_spacing_frac * x_range))
+
+    candidate_indices = []
+
+    for i in range(1, len(ys_smooth) - 1):
+        left = ys_smooth[i - 1]
+        center = ys_smooth[i]
+        right = ys_smooth[i + 1]
+
+        # Local maximum in y means a downward dip in image coordinates.
+        if center > left and center > right:
+            candidate_indices.append(i)
+
+    if not candidate_indices:
+        return []
+
+    # Estimate prominence by comparing point to nearby neighborhood.
+    valleys = []
+
+    for i in candidate_indices:
+        left_start = max(0, i - min_spacing)
+        right_end = min(len(ys_smooth), i + min_spacing + 1)
+
+        local_min = min(
+            float(ys_smooth[left_start:i].min()) if i > left_start else ys_smooth[i],
+            float(ys_smooth[i + 1:right_end].min()) if i + 1 < right_end else ys_smooth[i],
+        )
+
+        prominence = float(ys_smooth[i] - local_min)
+
+        if prominence >= min_prominence:
+            valleys.append((int(xs[i]), int(ys_smooth[i])))
+
+    # Remove valleys that are too close together.
+    valleys = sorted(valleys, key=lambda p: p[0])
+    filtered = []
+
+    for point in valleys:
+        if not filtered:
+            filtered.append(point)
+            continue
+
+        prev = filtered[-1]
+
+        if abs(point[0] - prev[0]) >= min_spacing:
+            filtered.append(point)
+        elif point[1] > prev[1]:
+            # Keep the deeper dip.
+            filtered[-1] = point
+
+    return filtered
+
+
+def select_internal_boundary_valleys(
+    valley_points: list[tuple[int, int]],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    Select internal finger valleys, avoiding extreme left/right edge valleys.
+    """
+    if len(valley_points) < 2:
+        raise RuntimeError("Not enough top-boundary valleys found.")
+
+    valleys = sorted(valley_points, key=lambda p: p[0])
+
+    # If we have many valleys, avoid the outermost points because those are
+    # often thumb/pinky edges rather than true finger valleys.
+    if len(valleys) >= 4:
+        internal = valleys[1:-1]
+    else:
+        internal = valleys
+
+    if len(internal) >= 2:
+        mid = len(internal) // 2
+        return internal[mid - 1], internal[mid]
+
+    return valleys[0], valleys[-1]
+
+
+def extract_top_boundary_valley_roi(
+    image: BgrImage,
+    config: RoiExtractionConfig,
+    *,
+    rough_rotate_first: bool = True,
+    smooth_window: int = 41,
+    min_prominence: float = 20.0,
+) -> TopBoundaryValleyRoiResult:
+    """
+    Extract palm ROI using top-boundary valley detection.
+
+    This method:
+    1. Segments the hand.
+    2. Roughly aligns the hand with PCA.
+    3. Finds the upper hand boundary.
+    4. Detects downward dips as candidate finger valleys.
+    5. Uses two internal valleys to align and crop the palm.
+    """
+    base_result = extract_hand_roi(image, config)
+
+    source_bgr = image
+    source_mask = base_result.hand_mask
+
+    rough_angle = 0.0
+
+    if rough_rotate_first:
+        axis_result = compute_mask_principal_axis(source_mask)
+        rough_angle = -axis_result.angle_deg
+
+        rough_bgr_result = rotate_image(
+            source_bgr,
+            rough_angle,
+            center=axis_result.centroid_xy,
+            interp=cv2.INTER_LINEAR,
+            border_value=0,
+        )
+
+        rough_mask_result = rotate_image(
+            source_mask,
+            rough_angle,
+            center=axis_result.centroid_xy,
+            interp=cv2.INTER_NEAREST,
+            border_value=0,
+        )
+
+        source_bgr = rough_bgr_result.image
+        source_mask = extract_largest_component(rough_mask_result.image)
+
+    boundary_points = extract_top_boundary_curve(
+        source_mask,
+        upper_frac=0.65,
+    )
+
+    valley_points = find_top_boundary_valleys(
+        boundary_points,
+        smooth_window=smooth_window,
+        min_prominence=min_prominence,
+    )
+
+    v1, v2 = select_internal_boundary_valleys(valley_points)
+
+    p1 = np.array(v1, dtype=np.float32)
+    p2 = np.array(v2, dtype=np.float32)
+
+    midpoint = (p1 + p2) / 2.0
+    dx, dy = p2 - p1
+
+    angle_deg = float(np.degrees(np.arctan2(dy, dx)))
+    valley_distance = float(np.linalg.norm(p2 - p1))
+
+    # Fine alignment: make selected valley line horizontal.
+    fine_rotate_by = -angle_deg
+
+    aligned_bgr_result = rotate_image(
+        source_bgr,
+        fine_rotate_by,
+        center=(float(midpoint[0]), float(midpoint[1])),
+        interp=cv2.INTER_LINEAR,
+        border_value=0,
+    )
+
+    aligned_mask_result = rotate_image(
+        source_mask,
+        fine_rotate_by,
+        center=(float(midpoint[0]), float(midpoint[1])),
+        interp=cv2.INTER_NEAREST,
+        border_value=0,
+    )
+
+    aligned_bgr = aligned_bgr_result.image
+    aligned_mask = extract_largest_component(aligned_mask_result.image)
+
+    # Transform midpoint after fine rotation.
+    M = aligned_bgr_result.matrix
+    midpoint_h = np.array([midpoint[0], midpoint[1], 1.0], dtype=np.float32)
+    aligned_midpoint = M @ midpoint_h
+
+    cx = int(aligned_midpoint[0])
+    cy = int(aligned_midpoint[1] + config.valley_down_scale * valley_distance)
+
+    crop_w = int(config.valley_crop_width_scale * valley_distance)
+    crop_h = int(config.valley_crop_height_scale * valley_distance)
+
+    h, w = aligned_bgr.shape[:2]
+
+    x0 = max(0, cx - crop_w // 2)
+    y0 = max(0, cy - crop_h // 2)
+    x1 = min(w, x0 + crop_w)
+    y1 = min(h, y0 + crop_h)
+
+    x0 = max(0, x1 - crop_w)
+    y0 = max(0, y1 - crop_h)
+
+    roi = aligned_bgr[y0:y1, x0:x1]
+
+    if config.valley_roi_size is not None:
+        roi = cv2.resize(
+            roi,
+            (config.valley_roi_size, config.valley_roi_size),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    final_roi = CropResult(
+        image=roi,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+    )
+
+    return TopBoundaryValleyRoiResult(
+        base_result=base_result,
+        boundary_points=boundary_points,
+        valley_points=valley_points,
+        selected_valleys=(v1, v2),
+        aligned_bgr=aligned_bgr,
+        aligned_mask=aligned_mask,
+        final_roi=final_roi,
+        angle_deg=rough_angle + angle_deg,
+        valley_distance=valley_distance,
     )
