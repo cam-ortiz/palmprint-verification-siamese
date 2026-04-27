@@ -2,6 +2,7 @@
 data/raw/
 data/interim/
 data/processed/
+data/qc/contact_sheets/
 
 # Checkpoints and logs
 checkpoints/

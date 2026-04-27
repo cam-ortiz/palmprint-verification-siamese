@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Dict
 
+from palmprint.datasets.roi_quality import filter_bad_roi_paths
+
 
 @dataclass(frozen=True)
 class Sample:
@@ -75,12 +77,23 @@ def collect_bmpd_samples(root_dir: str | Path) -> list[Sample]:
     Labels are created from filename person + hand side, not just
     folder name.
     """
-    root_dir = Path(root_dir)
-
+    root_dir = Path(root_dir).resolve()
+    
     image_paths = sorted(
         path
         for path in root_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in VALID_EXTENSIONS
+    )
+    
+    # ROI quality filtering
+    project_root = root_dir.parents[2]
+    quality_csv_path = project_root / "data" / "qc" / "roi_quality.csv"
+    
+    image_paths, qc_stats = filter_bad_roi_paths(
+        image_paths=image_paths,
+        quality_csv_path=quality_csv_path,
+        project_root=project_root,
+        verbose=True,
     )
 
     identity_to_paths: dict[str, list[Path]] = defaultdict(list)
