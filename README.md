@@ -1,4 +1,4 @@
-# Palmprint Recognition Using Siamese Neural Networks
+# Palmprint Verification Using a Siamese Neural Network
 
 Deep Learning (CS 4263-901)
 Cameron Ortiz, Myar Nguyen, Edison La
