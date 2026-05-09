@@ -11,14 +11,14 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 
-from palmprint.datasets.bmpd import Sample
+from palmprint.datasets.bmpd import BMPDSample
 
 
 Pair = tuple[str, str, int]
 
 
-def group_samples_by_label(samples: list[Sample]) -> dict[int, list[Sample]]:
-    label_to_samples: dict[int, list[Sample]] = defaultdict(list)
+def group_samples_by_label(samples: list[BMPDSample]) -> dict[int, list[BMPDSample]]:
+    label_to_samples: dict[int, list[BMPDSample]] = defaultdict(list)
 
     for sample in samples:
         label_to_samples[sample.label].append(sample)
@@ -27,7 +27,7 @@ def group_samples_by_label(samples: list[Sample]) -> dict[int, list[Sample]]:
 
 
 def generate_genuine_pair(
-    label_to_samples: dict[int, list[Sample]],
+    label_to_samples: dict[int, list[BMPDSample]],
     rng: random.Random,
 ) -> Pair:
     """
@@ -48,7 +48,7 @@ def generate_genuine_pair(
 
 
 def generate_impostor_pair(
-    label_to_samples: dict[int, list[Sample]],
+    label_to_samples: dict[int, list[BMPDSample]],
     rng: random.Random,
 ) -> Pair:
     """
@@ -68,7 +68,7 @@ def generate_impostor_pair(
 
 
 def generate_balanced_pairs(
-    samples: list[Sample],
+    samples: list[BMPDSample],
     num_pairs: int,
     seed: int = 42,
 ) -> list[Pair]:
